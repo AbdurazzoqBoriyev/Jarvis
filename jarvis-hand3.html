@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Jarvis</title>
+<style>
+  html, body { margin: 0; padding: 0; position: fixed; inset: 0; width: 100%; height: 100%; background: #02070c;
+    overflow: hidden; overscroll-behavior: none; touch-action: none; }
+  body { -webkit-user-select: none; user-select: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  video { position: fixed; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
+  #start {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    cursor: pointer; background: rgba(2, 7, 12, 0.35);
+  }
+  #start i {
+    width: 92px; height: 92px; border-radius: 50%; border: 2px solid #3ee8ff;
+    box-shadow: 0 0 30px rgba(62, 232, 255, 0.5), inset 0 0 20px rgba(62, 232, 255, 0.3);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  #status {
+    position: fixed; left: 0; right: 0; bottom: max(18px, env(safe-area-inset-bottom)); text-align: center;
+    font: 13px/1.4 system-ui, sans-serif; color: #8af4ff; opacity: 0; transition: opacity .4s;
+    padding: 0 20px; pointer-events: none; text-shadow: 0 0 8px rgba(62,232,255,.6);
+  }
+  #lang {
+    position: fixed; top: max(14px, env(safe-area-inset-top)); right: 14px; z-index: 10; display: flex;
+    border: 1px solid rgba(62, 232, 255, 0.5); border-radius: 999px; overflow: hidden;
+    font: 600 13px system-ui, sans-serif; color: #3ee8ff; background: rgba(2, 7, 12, 0.55); cursor: pointer;
+  }
+  #lang span { padding: 8px 14px; opacity: .5; }
+  #lang span.on { background: rgba(62, 232, 255, 0.22); opacity: 1; text-shadow: 0 0 8px rgba(62, 232, 255, 0.8); }
+  @keyframes pulse { 0%,100% { transform: scale(0.9); opacity: .6 } 50% { transform: scale(1.1); opacity: 1 } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="start"><i></i></div>
+<div id="lang"><span data-l="uz">UZ</span><span data-l="en">EN</span></div>
+<div id="status"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+(function () {
+  "use strict";
+
+  /* ====== SOZLAMALAR ====== */
+  var VOICE_PITCH = 0.2;     // past = qalin, qo'rqinchli ovoz (0.1 .. 1)
+  var VOICE_RATE = 0.82;     // past = sekinroq, dahshatliroq
+  var SHOW_HAND_DOTS = false;   // true qilsang qo'l nuqtalari ko'rinadi (kamera tasviri hech qachon ko'rsatilmaydi)
+
+  var statusEl = document.getElementById("status"), statusTimer = 0;
+  function setStatus(msg, ms) {
+    statusEl.textContent = msg; statusEl.style.opacity = msg ? 1 : 0;
+    clearTimeout(statusTimer);
+    if (msg && ms !== 0) statusTimer = setTimeout(function () { statusEl.style.opacity = 0; }, ms || 7000);
+  }
+
+  ["touchmove", "wheel", "gesturestart"].forEach(function (ev) {
+    document.addEventListener(ev, function (e) { e.preventDefault(); }, { passive: false });
+  });
+  window.addEventListener("scroll", function () { window.scrollTo(0, 0); });
+
+  var cv = document.getElementById("c"), ctx = cv.getContext("2d");
+  var video = document.getElementById("cam");
+  var W = 0, H = 0, dpr = 1;
+
+  /* ====== holat ====== */
+  var mode = "idle";            // idle | listening | thinking | speaking
+  var openT = 0.6;              // qo'lning ochiqligi 0 (musht) .. 1 (kaft)
+  var openS = 0.6;              // silliqlangan
+  var handSeen = false, handX = 0.5, handY = 0.5, lms = null;
+  var started = false;
+
+  /* ====== zarrachalar ====== */
+  var N = 1500, hx = new Float32Array(N), hy = new Float32Array(N), hz = new Float32Array(N);
+  var qx = new Float32Array(N), qy = new Float32Array(N), qz = new Float32Array(N), ph = new Float32Array(N);
+  var GA = Math.PI * (3 - Math.sqrt(5));
+  for (var i = 0; i < N; i++) {
+    var y = 1 - (i / (N - 1)) * 2, r = Math.sqrt(1 - y * y), th = GA * i;
+    hx[i] = Math.cos(th) * r; hy[i] = y; hz[i] = Math.sin(th) * r;
+    var a = Math.random() * 6.2832, b = Math.acos(2 * Math.random() - 1), rad = 0.7 + Math.random() * 1.5;
+    qx[i] = Math.sin(b) * Math.cos(a) * rad; qy[i] = Math.sin(b) * Math.sin(a) * rad; qz[i] = Math.cos(b) * rad;
+    ph[i] = Math.random() * 6.2832;
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  }
+  resize(); window.addEventListener("resize", resize);
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  var cx = 0, cy = 0, ang = 0, last = 0, amp = 0;
+  function frame(ts) {
+    var t = ts / 1000, dt = Math.min(0.05, t - last); last = t;
+
+    if (!handSeen) openT += (0.6 - openT) * 0.02;
+    openS += (openT - openS) * 0.16;
+
+    var tx = W / 2 + (handSeen ? (handX - 0.5) * W * 0.9 : 0);
+    var ty = H / 2 + (handSeen ? (handY - 0.5) * H * 0.8 : 0);
+    if (!cx) { cx = tx; cy = ty; }
+    cx += (tx - cx) * 0.12; cy += (ty - cy) * 0.12;
+
+    var ampT = 0.012;
+    if (mode === "speaking") ampT = 0.04 + 0.06 * Math.abs(Math.sin(t * 9.1) * Math.sin(t * 3.7));
+    else if (mode === "listening") ampT = 0.025 + 0.02 * Math.sin(t * 3);
+    else if (mode === "thinking") ampT = 0.03;
+    amp += (ampT - amp) * 0.12;
+    ang += (mode === "thinking" ? 1.6 : 0.3 + (1 - openS) * 0.5) * dt;
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.clearRect(0, 0, W, H);
+
+    var R = Math.min(W, H) * 0.30;
+    var tight = 1 - openS;                                  // musht = 1
+    var radius = 0.2 + 0.8 * clamp(openS * 1.5, 0, 1);      // musht: kichik shar
+    var scatter = clamp((openS - 0.45) / 0.55, 0, 1);       // kaft: yoyilish
+
+    // glow
+    var gr = R * (0.7 + scatter * 1.3);
+    var g = ctx.createRadialGradient(cx, cy, 0, cx, cy, gr);
+    g.addColorStop(0, "rgba(62,232,255," + (0.22 + tight * 0.5 + amp * 2).toFixed(3) + ")");
+    g.addColorStop(0.5, "rgba(62,232,255," + (0.06 + tight * 0.08).toFixed(3) + ")");
+    g.addColorStop(1, "rgba(62,232,255,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(cx - gr, cy - gr, gr * 2, gr * 2);
+
+    // particles
+    var ca = Math.cos(ang), sa = Math.sin(ang), ct = 0.94, st = 0.34;
+    ctx.fillStyle = "#8af4ff";
+    for (var j = 0; j < N; j++) {
+      var X = hx[j] * radius + qx[j] * scatter;
+      var Y = hy[j] * radius + qy[j] * scatter;
+      var Z = hz[j] * radius + qz[j] * scatter;
+      var w = 1 + amp * Math.sin(t * 5 + ph[j]) + (1 - scatter) * 0.015 * Math.sin(t * 2 + ph[j]);
+      var x1 = (X * ca + Z * sa) * w, z1 = -X * sa + Z * ca;
+      var y2 = (Y * ct - z1 * st) * w, z2 = Y * st + z1 * ct;
+      var depth = clamp((z2 / (1 + scatter * 2) + 1) / 2, 0, 1);
+      ctx.globalAlpha = (0.14 + 0.86 * depth) * (1 - scatter * 0.35);
+      var sz = (0.7 + 1.5 * depth) * (1 + tight * 0.5);
+      ctx.fillRect(cx + x1 * R, cy + y2 * R, sz, sz);
+    }
+
+    // core
+    ctx.globalAlpha = 0.95; ctx.fillStyle = "#e9fdff";
+    ctx.beginPath(); ctx.arc(cx, cy, 2.5 + tight * 5 + amp * 40, 0, 6.2832); ctx.fill();
+
+    // listening ring
+    if (mode === "listening" || mode === "thinking") {
+      ctx.globalAlpha = mode === "thinking" ? 0.65 : 0.25 + 0.15 * Math.sin(t * 3);
+      ctx.strokeStyle = "#3ee8ff"; ctx.lineWidth = 1.2;
+      ctx.setLineDash([6, 10]); ctx.lineDashOffset = -t * 40;
+      ctx.beginPath(); ctx.arc(cx, cy, R * 1.3 + scatter * R, 0, 6.2832); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // hand dots (feedback)
+    if (SHOW_HAND_DOTS && handSeen && lms) {
+      ctx.globalAlpha = 0.35; ctx.fillStyle = "#ffffff";
+      for (var k = 0; k < lms.length; k++) {
+        ctx.fillRect((1 - lms[k].x) * W - 1.5, lms[k].y * H - 1.5, 3, 3);
+      }
+    }
+    ctx.globalAlpha = 1;
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  window.__setOpen = function (v) { openT = openS = v; };   // sinov uchun
+
+  /* ====== qo'l: musht / kaft ====== */
+  function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+  function openness(lm) {
+    // har bir barmoq uchun: uchi bilan bilak orasidagi masofa / bukilish ildizi bilan bilak orasidagi masofa
+    // musht ~0.9-1.2, kaft ~1.8-2.2
+    var tips = [8, 12, 16, 20], mcp = [5, 9, 13, 17], s = 0;
+    for (var i = 0; i < 4; i++) s += dist(lm[0], lm[tips[i]]) / (dist(lm[0], lm[mcp[i]]) || 1e-6);
+    var ratio = s / 4;
+    return clamp((ratio - 1.15) / 0.65, 0, 1);
+  }
+  window.__openness = openness;
+
+  var HANDS_BASES = [
+    "https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/",
+    "https://unpkg.com/@mediapipe/hands@0.4.1675469240/"
+  ];
+  var handsBase = HANDS_BASES[0];
+
+  function loadHandsLib(cb) {
+    if (typeof Hands !== "undefined") return cb(true);
+    var s = document.createElement("script");
+    s.src = HANDS_BASES[1] + "hands.js"; s.crossOrigin = "anonymous";
+    s.onload = function () { handsBase = HANDS_BASES[1]; cb(typeof Hands !== "undefined"); };
+    s.onerror = function () { cb(false); };
+    document.head.appendChild(s);
+  }
+
+  function initHands() {
+    loadHandsLib(function (ok) {
+      if (!ok) { setStatus("Qo'l modeli yuklanmadi - internetni tekshiring", 10000); return; }
+      var hands = new Hands({ locateFile: function (f) { return handsBase + f; } });
+      hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+      hands.onResults(function (res) {
+        var l = res.multiHandLandmarks && res.multiHandLandmarks[0];
+        if (l) {
+          handSeen = true; lms = l;
+          openT = openness(l);
+          handX = 1 - l[9].x; handY = l[9].y;
+        } else { handSeen = false; lms = null; }
+      });
+      setStatus("Qo'l modeli yuklanmoqda...", 0);
+      hands.initialize().then(function () {
+        setStatus("Qo'lingizni kameraga ko'rsating", 4000);
+        var busy = false;
+        (function loop() {
+          if (!busy && video.readyState >= 2 && video.videoWidth > 0) {
+            busy = true;
+            hands.send({ image: video }).catch(function () {}).then(function () { busy = false; });
+          }
+          requestAnimationFrame(loop);
+        })();
+      }).catch(function () { setStatus("Qo'l modeli yuklanmadi - internetni tekshiring", 10000); });
+    });
+  }
+
+  function getCam() {
+    var tries = [
+      { video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false },
+      { video: { facingMode: "user" }, audio: false },
+      { video: true, audio: false }
+    ], i = 0;
+    function next() {
+      return navigator.mediaDevices.getUserMedia(tries[i++]).catch(function (e) {
+        if (i >= tries.length || (e && (e.name === "NotAllowedError" || e.name === "SecurityError"))) throw e;
+        return next();
+      });
+    }
+    return next();
+  }
+
+  function insecureMsg() {
+    return "Mikrofon va kamera ruxsati so'ralmaydi, chunki sahifa xavfsiz (https) emas. Faylni saytga joylab https:// orqali oching.";
+  }
+
+  function initCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus(insecureMsg(), 0); return;
+    }
+    getCam().then(function (stream) {
+      video.setAttribute("playsinline", ""); video.setAttribute("muted", ""); video.muted = true;
+      video.srcObject = stream;
+      return video.play().catch(function () {});
+    }).then(initHands).catch(function (e) {
+      var n = e && e.name;
+      if (n === "NotAllowedError" || n === "SecurityError") setStatus("Kameraga ruxsat berilmagan - brauzer sozlamalaridan yoqing", 10000);
+      else if (n === "NotFoundError") setStatus("Kamera topilmadi", 8000);
+      else if (n === "NotReadableError") setStatus("Kamera boshqa ilova tomonidan band", 8000);
+      else setStatus("Kamera ochilmadi", 8000);
+    });
+  }
+
+  /* ====== til ====== */
+  var lang = "uz";
+  try { var sv = localStorage.getItem("jarvis-lang"); if (sv === "en" || sv === "uz") lang = sv; } catch (e) {}
+  var REC_LANG = { uz: "uz-UZ", en: "en-US" };
+  function L(uz, en) { return lang === "uz" ? uz : en; }
+
+  var langBox = document.getElementById("lang");
+  function paintLang() {
+    var sp = langBox.getElementsByTagName("span");
+    for (var i = 0; i < sp.length; i++) sp[i].className = sp[i].getAttribute("data-l") === lang ? "on" : "";
+  }
+  paintLang();
+
+  /* ====== ovoz chiqarish (qalin, qo'rqinchli) ====== */
+  var voices = [];
+  function loadVoices() { try { voices = speechSynthesis.getVoices() || []; } catch (e) { voices = []; } }
+  loadVoices();
+  try { speechSynthesis.onvoiceschanged = loadVoices; } catch (e) {}
+
+  function pickVoice() {
+    var dflt = { v: null, lang: lang === "uz" ? "uz-UZ" : "en-US" };
+    if (!voices.length) return dflt;
+    var order = lang === "uz" ? ["uz", "tr", "ru"] : ["en"];
+    for (var o = 0; o < order.length; o++) {
+      var best = null;
+      for (var i = 0; i < voices.length; i++) {
+        var v = voices[i], vl = (v.lang || "").toLowerCase().replace("_", "-");
+        if (vl.indexOf(order[o]) !== 0) continue;
+        var n = v.name || "";
+        if (/\bmale\b|david|daniel|james|guy|mark|george|ryan/i.test(n)) { best = v; break; }
+        if (!best || (order[o] === "en" && /en-gb/.test(vl))) best = v;
+      }
+      if (best) return { v: best, lang: best.lang };
+    }
+    return dflt;
+  }
+
+  function speak(text, done) {
+    mode = "speaking";
+    var finished = false, wd = 0;
+    function finish() {
+      if (finished) return; finished = true; clearTimeout(wd);
+      mode = "idle"; if (done) done();
+    }
+    try {
+      speechSynthesis.cancel();
+      var u = new SpeechSynthesisUtterance(text);
+      var p = pickVoice();
+      if (p.v) u.voice = p.v;
+      u.lang = p.lang;
+      u.rate = VOICE_RATE; u.pitch = VOICE_PITCH; u.volume = 1;
+      u.onend = u.onerror = finish;
+      wd = setTimeout(finish, 3000 + text.length * 130);   // onend kelmasa mikrofon qotib qolmasligi uchun
+      speechSynthesis.speak(u);
+    } catch (e) { finish(); }
+  }
+
+  /* ====== yordamchilar ====== */
+  function two(n) { return (n < 10 ? "0" : "") + n; }
+  function norm(s) {
+    return s.toLowerCase().replace(/[\u02bb\u02bc\u2019\u2018`\u00b4]/g, "'").replace(/\s+/g, " ").trim();
+  }
+  var NUMW = { zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+    eleven: 11, twelve: 12, fifteen: 15, twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60,
+    bir: 1, ikki: 2, uch: 3, "to'rt": 4, besh: 5, olti: 6, yetti: 7, sakkiz: 8, "to'qqiz": 9, "o'n": 10,
+    yigirma: 20, "o'ttiz": 30, qirq: 40, ellik: 50, oltmish: 60 };
+  function digits(t) {
+    return t.replace(/[a-z']+/g, function (w) { return NUMW.hasOwnProperty(w) ? String(NUMW[w]) : w; });
+  }
+  function fmtNum(n) { return String(Math.round(n * 10000) / 10000); }
+
+  function jget(url, ms) {
+    return new Promise(function (res, rej) {
+      var done = false, tm = setTimeout(function () { if (!done) { done = true; rej(new Error("timeout")); } }, ms || 9000);
+      fetch(url).then(function (r) { return r.json(); }).then(function (j) {
+        if (!done) { done = true; clearTimeout(tm); res(j); }
+      }).catch(function (e) { if (!done) { done = true; clearTimeout(tm); rej(e); } });
+    });
+  }
+
+  /* ====== ob-havo ====== */
+  function wxText(c) {
+    if (c === 0) return L("ochiq osmon", "clear sky");
+    if (c <= 3) return L("biroz bulutli", "partly cloudy");
+    if (c === 45 || c === 48) return L("tuman", "foggy");
+    if (c >= 51 && c <= 57) return L("mayda yomg'ir", "drizzle");
+    if ((c >= 61 && c <= 67) || (c >= 80 && c <= 82)) return L("yomg'ir", "rain");
+    if ((c >= 71 && c <= 77) || c === 85 || c === 86) return L("qor", "snow");
+    if (c >= 95) return L("momaqaldiroq", "a thunderstorm");
+    return L("noma'lum", "unknown conditions");
+  }
+  function forecast(lat, lon, place) {
+    return jget("https://api.open-meteo.com/v1/forecast?latitude=" + lat + "&longitude=" + lon +
+      "&current=temperature_2m,weather_code,wind_speed_10m&timezone=auto").then(function (j) {
+      var c = j.current; if (!c) throw new Error("no data");
+      var tt = Math.round(c.temperature_2m), ts = tt < 0 ? "minus " + Math.abs(tt) : String(tt);
+      var w = Math.round(c.wind_speed_10m), d = wxText(c.weather_code);
+      return place
+        ? L(place + "da hozir " + ts + " daraja, " + d + ". Shamol soatiga " + w + " kilometr.",
+            "In " + place + " it is " + ts + " degrees, " + d + ". Wind " + w + " kilometers per hour.")
+        : L("Hozir " + ts + " daraja, " + d + ". Shamol soatiga " + w + " kilometr.",
+            "Right now it is " + ts + " degrees, " + d + ". Wind " + w + " kilometers per hour.");
+    });
+  }
+  function getPos() {
+    return new Promise(function (res) {
+      if (!navigator.geolocation) return res(null);
+      navigator.geolocation.getCurrentPosition(function (p) { res(p.coords); }, function () { res(null); },
+        { timeout: 8000, maximumAge: 600000 });
+    });
+  }
+  function weather(t) {
+    var city = null, m;
+    if ((m = t.match(/(?:weather|forecast)\s+(?:like\s+)?(?:in|at|for|of)\s+([a-z' -]+)/))) city = m[1];
+    else if ((m = t.match(/([a-z']+?)(?:da|dagi|ning|dan)?\s+ob-?\s?havo/))) city = m[1];
+    else if ((m = t.match(/ob-?\s?havo\s+([a-z']+)/))) city = m[1];
+    if (city) {
+      city = city.replace(/\b(today|now|tomorrow|right now|please)\b/g, "").trim();
+      if (!city || /^(bugun|hozir|qanday|ertaga|bugungi|today|now|how|the|like|what|whats|menga|bizga)$/.test(city)) city = null;
+    }
+    var fail = L("Ob-havo ma'lumotini ololmadim, boss. Internetni tekshiring.", "I couldn't get the weather, boss. Check the connection.");
+    if (city) {
+      return jget("https://geocoding-api.open-meteo.com/v1/search?count=1&format=json&language=en&name=" + encodeURIComponent(city))
+        .then(function (j) {
+          var r = j.results && j.results[0];
+          if (!r) return L("Bunday shaharni topa olmadim, boss.", "I couldn't find that city, boss.");
+          return forecast(r.latitude, r.longitude, r.name);
+        }).catch(function () { return fail; });
+    }
+    return getPos().then(function (c) {
+      if (!c) return L("Joylashuvingizni aniqlay olmadim. Shahar nomini ayting, masalan: Toshkentda ob-havo.",
+                       "I couldn't find your location. Tell me a city, for example: weather in London.");
+      return forecast(c.latitude, c.longitude, null).catch(function () { return fail; });
+    });
+  }
+
+  /* ====== Vikipediya ====== */
+  function wikiTopic(t) {
+    var m;
+    if ((m = t.match(/^(?:who is|who was|who are|what is|what's|what are|what was|tell me about|tell me something about|explain|define|search for|look up|wikipedia)\s+(?:a |an |the )?(.+)$/))) return m[1];
+    if ((m = t.match(/^(.+?)\s+(?:kim|nima|nimaligi|haqida|xaqida|to'g'risida|togrisida)(?:\s|$)/)))
+      return m[1].replace(/^(?:menga|bizga|manga|iltimos)\s+/, "");
+    return null;
+  }
+  function wiki(topic) {
+    var lc = lang === "uz" ? "uz" : "en";
+    var url = "https://" + lc + ".wikipedia.org/w/api.php?action=query&generator=search&gsrlimit=1&prop=extracts" +
+      "&exintro=1&explaintext=1&exsentences=2&format=json&origin=*&gsrsearch=" + encodeURIComponent(topic);
+    return jget(url).then(function (j) {
+      var pages = j.query && j.query.pages, best = null;
+      if (pages) for (var k in pages) if (!best || pages[k].index < best.index) best = pages[k];
+      var ex = best && best.extract;
+      if (!ex) return L("Bu haqida ma'lumot topa olmadim, boss.", "I couldn't find anything about that, boss.");
+      ex = ex.replace(/\([^)]*\)/g, "").replace(/\s+/g, " ").trim();
+      if (ex.length > 330) { var cut = ex.lastIndexOf(".", 330); ex = ex.slice(0, cut > 80 ? cut + 1 : 330); }
+      return ex;
+    }).catch(function () { return L("Ma'lumot ololmadim, boss. Internetni tekshiring.", "I couldn't look that up, boss. Check the connection."); });
+  }
+
+  /* ====== hisob-kitob ====== */
+  function tryMath(raw) {
+    var t = digits(raw);
+    var nums = t.match(/\d+(?:[.,]\d+)?/g);
+    if (!nums || nums.length < 2) return null;
+    var a = parseFloat(nums[0].replace(",", ".")), b = parseFloat(nums[1].replace(",", ".")), r, ok = true;
+    if (/times|multipl|\*|\u00d7|\bx\b|ko'payt|kopayt|ko'pay/.test(t)) r = a * b;
+    else if (/divid|\bover\b|\/|\u00f7|bo'l|bolin/.test(t)) { if (b === 0) return L("Nolga bo'lib bo'lmaydi, boss.", "I can't divide by zero, boss."); r = a / b; }
+    else if (/plus|\+|qo'sh|qosh|\badd\b/.test(t)) r = a + b;
+    else if (/minus|\d\s*-\s*\d|ayir|subtract|take away/.test(t)) r = a - b;
+    else ok = false;
+    if (!ok) return null;
+    return L("Natija " + fmtNum(r) + ", boss.", "That makes " + fmtNum(r) + ", boss.");
+  }
+
+  /* ====== taymer ====== */
+  function fmtDur(sec) {
+    var n;
+    if (sec % 3600 === 0) { n = sec / 3600; return L(n + " soat", n + (n === 1 ? " hour" : " hours")); }
+    if (sec >= 60 && sec % 60 === 0) { n = sec / 60; return L(n + " daqiqa", n + (n === 1 ? " minute" : " minutes")); }
+    return L(sec + " soniya", sec + (sec === 1 ? " second" : " seconds"));
+  }
+  function stopRec() {
+    try { if (rec) { rec.onend = rec.onerror = rec.onresult = null; rec.abort(); } } catch (e) {}
+  }
+  function announce(text) {
+    if (busyTalk) { setTimeout(function () { announce(text); }, 1500); return; }
+    busyTalk = true; stopRec();
+    speak(text, function () { busyTalk = false; setTimeout(listen, 300); });
+  }
+  function tryTimer(raw) {
+    if (!/taymer|timer|eslat|remind/.test(raw)) return null;
+    var t = digits(raw);
+    var m = t.match(/(\d+(?:[.,]\d+)?)\s*(soat|hour|daqiqa|minut|min|soniya|sekund|second|sec)/);
+    if (!m) return L("Necha daqiqaga qo'yay? Masalan: besh daqiqaga taymer.", "For how long? For example: timer for five minutes.");
+    var n = parseFloat(m[1].replace(",", ".")), u = m[2];
+    var mult = /^(soat|hour)/.test(u) ? 3600 : (/^(daqiqa|minut|min)/.test(u) ? 60 : 1);
+    var sec = Math.round(n * mult);
+    if (sec < 1 || sec > 6 * 3600) return L("Taymer 1 soniyadan 6 soatgacha bo'lishi mumkin.", "A timer can be from 1 second to 6 hours.");
+    setTimeout(function () { announce(L("Taymer tugadi, boss.", "Time is up, boss.")); }, sec * 1000);
+    return L("Taymer " + fmtDur(sec) + "ga qo'yildi, boss.", "Timer set for " + fmtDur(sec) + ", boss.");
+  }
+
+  /* ====== hazillar ====== */
+  var JOKES = {
+    uz: [
+      "Nega kompyuter hech qachon sovuq qotmaydi? Chunki unda doim oynalar ochiq.",
+      "Dasturchi nega qorong'u rejimni yaxshi ko'radi? Chunki yorug'lik xatolarni jalb qiladi.",
+      "Robot nega kofe ichmaydi? Chunki u allaqachon zaryadlangan."
+    ],
+    en: [
+      "Why do programmers prefer dark mode? Because light attracts bugs.",
+      "There are only ten kinds of people: those who understand binary, and those who don't.",
+      "Why was the computer cold? It left its Windows open."
+    ]
+  };
+
+  var DAYS_UZ = ["yakshanba", "dushanba", "seshanba", "chorshanba", "payshanba", "juma", "shanba"];
+  var MON_UZ = ["yanvar", "fevral", "mart", "aprel", "may", "iyun", "iyul", "avgust", "sentyabr", "oktyabr", "noyabr", "dekabr"];
+
+  /* ====== miya ====== */
+  function setLang(l, silent) {
+    if (l !== "uz" && l !== "en") return;
+    lang = l;
+    try { localStorage.setItem("jarvis-lang", l); } catch (e) {}
+    paintLang();
+    if (silent || !started) return;
+    busyTalk = true; stopRec(); mode = "idle";
+    speak(L("Til o'zbekchaga o'tdi, boss.", "Language switched to English, boss."), function () { busyTalk = false; setTimeout(listen, 300); });
+  }
+
+  function brain(raw) {
+    var t = norm(raw), m;
+
+    if (/(ingliz|english)/.test(t) && /(gapir|tilida|tilga|speak|talk|switch to|change to)/.test(t)) { setLang("en", true); return "Language switched to English, boss."; }
+    if (/(o'zbek|uzbek)/.test(t) && /(gapir|tilida|tilga|speak|talk|switch to|change to)/.test(t)) { setLang("uz", true); return "Til o'zbekchaga o'tdi, boss."; }
+
+    if (/ob-?\s?havo|weather|forecast|harorat|temperature/.test(t)) return weather(t);
+    if ((m = tryTimer(t))) return m;
+    if ((m = tryMath(t))) return m;
+
+    if (/soat (necha|nechchi|qancha)|vaqt|necha bo'ldi|what time|the time|time is it|current time/.test(t)) {
+      var d = new Date(), h = d.getHours(), mi = d.getMinutes(), ap = h >= 12 ? "PM" : "AM";
+      if (lang === "uz") return mi === 0 ? "Soat " + h + " bo'ldi, boss." : "Soat " + h + " dan " + mi + " daqiqa o'tdi, boss.";
+      return "It's " + ((h % 12) || 12) + ":" + two(mi) + " " + ap + ", boss.";
+    }
+    if (/sana|bugun nima kun|qaysi kun|nechanchi|what('s| is) the date|today's date|what day|which day/.test(t)) {
+      var n = new Date();
+      if (lang === "uz") return "Bugun " + n.getFullYear() + " yil " + n.getDate() + " " + MON_UZ[n.getMonth()] + ", " + DAYS_UZ[n.getDay()] + ", boss.";
+      return "Today is " + n.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" }) + ", boss.";
+    }
+    if (/isming|ismingiz|kimsan|kimsiz|your name|who are you/.test(t)) return L("Men Jarvisman, sizning shaxsiy yordamchingiz, boss.", "I'm Jarvis, your personal assistant, boss.");
+    if (/qalaysan|qalaysiz|yaxshimisan|yaxshimisiz|ahvol|nima gap|how are you|how's it going|how do you do/.test(t))
+      return L("Yaxshiman, boss. Buyruqingizni kutyapman.", "I'm doing great, boss. Ready when you are.");
+    if (/^(salom|assalomu|assalom|alaykum|hello|hi|hey|yo)\b/.test(t)) return L("Salom, boss. Qalaysiz?", "Hi boss, how are you?");
+    if (/^(yaxshi|zo'r|a'lo|durust)|(i'?m|i am|im) (fine|good|great|well|ok|okay)|^(fine|good|great)\b/.test(t))
+      return L("Bunga xursandman, boss. Sizga qanday yordam bera olaman?", "Glad to hear that, boss. How can I help you?");
+    if (/rahmat|raxmat|thank/.test(t)) return L("Marhamat, boss.", "Anytime, boss.");
+    if (/xayr|ko'rishguncha|\bbye\b|goodbye|see you/.test(t)) return L("Xayr, boss. Men shu yerdaman.", "Goodbye, boss. I'll be right here.");
+    if (/hazil|latifa|kuldir|joke|funny/.test(t)) { var J = JOKES[lang]; return J[Math.floor(Math.random() * J.length)]; }
+    if (/nima qila olasan|nimalar qila olasan|yordam|what can you do|\bhelp\b/.test(t))
+      return L("Men vaqt, sana, ob-havo, hisob-kitob, taymer, hazil va Vikipediyadan ma'lumot bera olaman.",
+               "I can tell time and date, the weather, do math, set timers, tell jokes and look things up on Wikipedia.");
+
+    var topic = wikiTopic(t);
+    if (topic) return wiki(topic);
+
+    return L("Buni hali tushunmayman, boss.", "I don't understand that yet, boss.");
+  }
+
+  /* ====== ovoz tanish (doim tinglab turadi) ====== */
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition, rec = null, alive = false, busyTalk = false;
+  var retryMs = 250;
+
+  function listen() {
+    if (!SR || !alive || busyTalk) return;
+    try {
+      stopRec();
+      rec = new SR();
+      rec.lang = REC_LANG[lang]; rec.continuous = false; rec.interimResults = false; rec.maxAlternatives = 1;
+      rec.onstart = function () { if (mode === "idle") mode = "listening"; };
+      rec.onresult = function (e) {
+        var text = e.results[e.results.length - 1][0].transcript;
+        if (!text || !text.trim()) return;
+        retryMs = 250;
+        busyTalk = true; mode = "thinking";
+        Promise.resolve().then(function () { return brain(text); })
+          .catch(function () { return L("Xatolik yuz berdi, boss.", "Something went wrong, boss."); })
+          .then(function (reply) {
+            speak(reply, function () { busyTalk = false; setTimeout(listen, 300); });
+          });
+      };
+      rec.onerror = function (e) {
+        if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+          alive = false; mode = "idle";
+          if (!window.isSecureContext) setStatus(insecureMsg(), 0);
+          else setStatus("Mikrofonga ruxsat berilmagan - brauzer sozlamalaridan yoqing", 12000);
+        } else if (e.error === "audio-capture") {
+          alive = false; mode = "idle"; setStatus("Mikrofon topilmadi", 8000);
+        } else if (e.error === "network") {
+          retryMs = Math.min(retryMs * 2, 4000); setStatus("Ovoz tanish uchun internet kerak", 5000);
+        } else if (e.error === "language-not-supported") {
+          setStatus("Bu brauzer tanlangan tilni tanimaydi", 6000);
+        }
+      };
+      rec.onend = function () {
+        if (mode === "listening") mode = "idle";
+        if (alive && !busyTalk) setTimeout(listen, retryMs);
+      };
+      rec.start();
+    } catch (e) { setTimeout(listen, 800); }
+  }
+
+  function askMic() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return Promise.resolve(true);
+    return navigator.mediaDevices.getUserMedia({ audio: true }).then(function (st) {
+      st.getTracks().forEach(function (tr) { tr.stop(); }); return true;
+    }).catch(function () { return false; });
+  }
+
+  window.__brain = brain;
+
+  /* ====== til tugmasi ====== */
+  langBox.addEventListener("click", function (e) {
+    e.stopPropagation();
+    var l = e.target.getAttribute && e.target.getAttribute("data-l");
+    if (l && l !== lang) setLang(l, false);
+  });
+
+  /* ====== ishga tushirish ====== */
+  document.getElementById("start").addEventListener("click", function () {
+    if (started) return;
+    started = true;
+    this.style.display = "none";
+    if (!window.isSecureContext) setStatus(insecureMsg(), 0);
+    loadVoices();
+    if (!SR) {
+      initCamera();
+      speak(L("Kechirasiz boss, bu brauzer meni eshita olmaydi. Chrome'da oching.", "Sorry boss, this browser can't hear me. Please open me in Chrome."));
+      setStatus("Bu brauzer ovoz tanishni qo'llamaydi - Chrome ishlating", 10000);
+      return;
+    }
+    askMic().then(function (ok) {
+      initCamera();
+      if (!ok && window.isSecureContext) setStatus("Mikrofonga ruxsat berilmagan - brauzer sozlamalaridan yoqing", 10000);
+      alive = ok;
+      busyTalk = true;
+      speak(L("Jarvis ishga tushdi.", "Jarvis online."), function () { busyTalk = false; listen(); });
+    });
+  });
+})();
+</script>
+</body>
+</html>
